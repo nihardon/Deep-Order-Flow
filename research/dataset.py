@@ -2,99 +2,237 @@ import h5py
 import torch
 import json
 import numpy as np
+import random
 from torch_geometric.data import Data, Dataset
 from tqdm import tqdm
 
 class LOBDataset(Dataset):
-    def __init__(self, h5_file, lookahead=20):
+    def __init__(self, h5_file, lookahead=100): 
+        """
+        Args:
+            h5_file (str): Path to the .h5 file containing 'raw_json' dataset.
+            lookahead (int): How many ticks into the future to predict price movement.
+        """
         super().__init__(root=None, transform=None, pre_transform=None)
         self.h5_file = h5_file
         self.lookahead = lookahead
         self.samples = [] 
         
-        print("--- REPLAYING MARKET DATA (SENSITIVE MODE) ---")
+        print(f"--- PROCESSING DATASET ({h5_file}) ---")
         self.process_file()
             
     def process_file(self):
-        self.bids = {} 
-        self.asks = {}
-        self.mid_prices = []
+        up_samples = []
+        down_samples = []
+        flat_samples = []
+        
+        # Order Book State (Price -> Volume)
+        bids = {} 
+        asks = {}
+        
+        # History Tracking
+        mid_prices = []
+        prev_bid_p = 0; prev_bid_v = 0
+        prev_ask_p = 0; prev_ask_v = 0
+        
+        buffer = [] 
         
         with h5py.File(self.h5_file, 'r') as f:
-            timestamps = f['timestamp'][:]
-            raw_json = f['raw_json'][:]
-            total_msgs = len(timestamps) - self.lookahead
+            if 'raw_json' not in f:
+                print("Error: 'raw_json' dataset not found in file.")
+                return
+
+            raw_data = f['raw_json'][:]
+            total_msgs = len(raw_data)
             
-            for i in tqdm(range(total_msgs), desc="Feature Engineering"):
+            print(f"Scanning {total_msgs} market events...")
+
+            for i in tqdm(range(total_msgs), desc="Replaying Market"):
                 try:
-                    msg_json = json.loads(raw_json[i].decode('utf-8'))
+                    line = raw_data[i]
+                    if isinstance(line, bytes):
+                        line = line.decode('utf-8')
                     
-                    if isinstance(msg_json, list):
-                        data = msg_json[1]
-                        if 'bs' in data or 'as' in data:
-                            self.bids = {float(x[0]): float(x[1]) for x in data.get('bs', [])}
-                            self.asks = {float(x[0]): float(x[1]) for x in data.get('as', [])}
-                        elif 'b' in data or 'a' in data:
-                            for item in data.get('b', []):
-                                p, v = float(item[0]), float(item[1])
-                                if v == 0: self.bids.pop(p, None) 
-                                else: self.bids[p] = v
-                            for item in data.get('a', []):
-                                p, v = float(item[0]), float(item[1])
-                                if v == 0: self.asks.pop(p, None)
-                                else: self.asks[p] = v
+                    data = json.loads(line)
                     
-                    if len(self.bids) >= 10 and len(self.asks) >= 10:
-                        sorted_bids = sorted(self.bids.items(), key=lambda x: x[0], reverse=True)[:10]
-                        sorted_asks = sorted(self.asks.items(), key=lambda x: x[0])[:10]
+                    if not isinstance(data, list) or len(data) < 2: 
+                        continue
                         
-                        mid_price = (sorted_bids[0][0] + sorted_asks[0][0]) / 2
-                        self.mid_prices.append(mid_price)
+                    payload = data[1]
+                    if not isinstance(payload, dict): 
+                        continue
+
+                    # Update Order Book State
+
+                    # Update Bids
+                    for item in payload.get('bs', []) + payload.get('b', []):
+                        price = float(item[0])
+                        volume = float(item[1])
+                        if volume == 0:
+                            bids.pop(price, None) 
+                        else:
+                            bids[price] = volume  
+                            
+                    # Update Asks
+                    for item in payload.get('as', []) + payload.get('a', []):
+                        price = float(item[0])
+                        volume = float(item[1])
+                        if volume == 0:
+                            asks.pop(price, None)
+                        else:
+                            asks[price] = volume
+
+                    if len(bids) < 10 or len(asks) < 10: 
+                        continue
+
+                    # Sort & Extract Best Prices
+                    
+                    # Bids = Descending (Highest buy is best)
+                    sorted_bids = sorted(bids.items(), key=lambda x: x[0], reverse=True)[:10]
+                    
+                    # Asks = Ascending (Lowest sell is best)
+                    sorted_asks = sorted(asks.items(), key=lambda x: x[0])[:10]
+                    
+                    best_bid_p = sorted_bids[0][0]; best_bid_v = sorted_bids[0][1]
+                    best_ask_p = sorted_asks[0][0]; best_ask_v = sorted_asks[0][1]
+                    mid_price = (best_bid_p + best_ask_p) / 2
+                    mid_prices.append(mid_price)
+                    
+                    # Calculate Order Flow Imbalance (OFI)
+                    ofi_bid = 0
+                    if best_bid_p > prev_bid_p: ofi_bid = best_bid_v
+                    elif best_bid_p < prev_bid_p: ofi_bid = -prev_bid_v
+                    else: ofi_bid = best_bid_v - prev_bid_v
+                    
+                    ofi_ask = 0
+                    if best_ask_p > prev_ask_p: ofi_ask = prev_ask_v
+                    elif best_ask_p < prev_ask_p: ofi_ask = -prev_ask_v
+                    else: ofi_ask = best_ask_v - prev_ask_v
+                    
+                    net_ofi = ofi_bid - ofi_ask
+                    
+                    # Update previous state
+                    prev_bid_p = best_bid_p; prev_bid_v = best_bid_v
+                    prev_ask_p = best_ask_p; prev_ask_v = best_ask_v
+
+                    # Create Sample
+                    if len(mid_prices) > 10:
+                        recent_history = mid_prices[-10:]
+                        sample_data = {
+                            'mid': mid_price,
+                            'hist': recent_history,
+                            'bids': sorted_bids,
+                            'asks': sorted_asks,
+                            'ofi': net_ofi
+                        }
+                        buffer.append(sample_data)
                         
-                        if len(self.mid_prices) > 10:
-                            recent_history = self.mid_prices[-10:]
-                            self.samples.append((i, sorted_bids, sorted_asks, mid_price, recent_history))
+                        # Labeling
+                        if len(buffer) > self.lookahead:
+                            old_sample = buffer.pop(0) 
+                            start_price = old_sample['mid']
+                            end_price = mid_price 
+                            
+                            # Percentage return
+                            # (End - Start) / Start
+                            ret = (end_price - start_price) / start_price
+                            
+                            threshold = 0.00002 
+                            
+                            if ret > threshold:
+                                up_samples.append(self.create_data_object(old_sample, 2))
+                            elif ret < -threshold:
+                                down_samples.append(self.create_data_object(old_sample, 0))
+                            else:
+                                if random.random() < 0.20: 
+                                    flat_samples.append(self.create_data_object(old_sample, 1))
 
                 except Exception:
                     continue
-
-    def len(self):
-        return len(self.samples)
-
-    def get(self, idx):
-        current_index, bids, asks, current_mid, history = self.samples[idx]
         
-        volatility = np.std(history)
-        momentum = (current_mid - history[0])
-        spread = asks[0][0] - bids[0][0]
+        # Balance the Dataset
+        print(f"DEBUG: Found {len(up_samples)} UP, {len(down_samples)} DOWN, {len(flat_samples)} FLAT")
         
-        total_bid_vol = sum([v for p, v in bids])
-        total_ask_vol = sum([v for p, v in asks])
+        # Robust Minimum Size
+        if len(up_samples) == 0 or len(down_samples) == 0:
+            print("WARNING: Dataset is missing a class (likely DOWN). Training will be imbalanced.")
+            min_len = min(len(flat_samples), max(len(up_samples), len(down_samples)))
+            if min_len == 0: min_len = 100 
+        else:
+            min_len = min(len(up_samples), len(down_samples))
+
+        # Truncate to balance
+        up_samples = up_samples[:min_len]
+        down_samples = down_samples[:min_len]
+        flat_samples = flat_samples[:min_len]
+
+        self.samples = up_samples + down_samples + flat_samples
+        random.shuffle(self.samples)
+        
+        print(f"FINAL DATASET: {len(self.samples)} balanced samples.")
+        print(f"   - UP:   {len(up_samples)}")
+        print(f"   - DOWN: {len(down_samples)}")
+        print(f"   - FLAT: {len(flat_samples)}")
+
+    def create_data_object(self, sample, label):
+        """
+        Converts a dictionary of raw market data into a PyTorch Geometric Graph object.
+        Features are normalized to be Percentage/Relative.
+        """
+        current_mid = sample['mid']
+        history = sample['hist']
+        bids = sample['bids']
+        asks = sample['asks']
+        ofi = sample['ofi']
+                
+        # Volatility (Std Dev of % Returns of the last 10 ticks)
+        hist_pct = [(history[i] - history[i-1])/history[i-1] for i in range(1, len(history))]
+        if len(hist_pct) == 0: hist_pct = [0.0]
+        volatility = np.std(hist_pct) * 1000
+        
+        # Momentum (% Change from 10 ticks ago)
+        momentum = (current_mid - history[0]) / history[0] * 1000 
+        
+        # Spread (% of price)
+        spread = (asks[0][0] - bids[0][0]) / current_mid * 1000
+        
+        # OFI (Normalized)
+        ofi_norm = np.tanh(ofi) 
+        
+        # Volume Imbalance
+        total_bid_vol = sum(v for p, v in bids)
+        total_ask_vol = sum(v for p, v in asks)
         imbalance = (total_bid_vol - total_ask_vol) / (total_bid_vol + total_ask_vol + 1e-5)
 
+        # Build Graph Nodes
         node_features = []
+        
+        # Process Bids
         for p, v in bids:
+            # Price Distance (%)
             norm_p = (p - current_mid) / current_mid * 1000 
-            log_v = np.log(v + 1.0)
-            node_features.append([norm_p, log_v, -1.0, imbalance, spread, momentum, volatility])
+            log_v = np.log(v + 1.0) 
+            
+            # Feature Vector
+            # [PriceDist, LogVol, Side(-1), Imbalance, Spread, Momentum, Volatility, OFI]
+            node_features.append([norm_p, log_v, -1.0, imbalance, spread, momentum, volatility, ofi_norm])
+            
+        # Process Asks
         for p, v in asks:
             norm_p = (p - current_mid) / current_mid * 1000
             log_v = np.log(v + 1.0)
-            node_features.append([norm_p, log_v, 1.0, imbalance, spread, momentum, volatility])
+            
+            # Feature Vector
+            # [PriceDist, LogVol, Side(+1), Imbalance, Spread, Momentum, Volatility, OFI]
+            node_features.append([norm_p, log_v, 1.0, imbalance, spread, momentum, volatility, ofi_norm])
             
         x = torch.tensor(node_features, dtype=torch.float)
         
         edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
         
-        future_idx = min(idx + 10, len(self.samples) - 1)
-        future_mid = self.samples[future_idx][3]
+        y = torch.tensor([label], dtype=torch.long)
         
-
-        threshold = 0.00001 
-        pct_change = (future_mid - current_mid) / current_mid
-        
-        if pct_change > threshold: y = torch.tensor([2], dtype=torch.long)  
-        elif pct_change < -threshold: y = torch.tensor([0], dtype=torch.long) 
-        else: y = torch.tensor([1], dtype=torch.long)                        
-
         return Data(x=x, edge_index=edge_index, y=y)
+
+    def len(self): return len(self.samples)
+    def get(self, idx): return self.samples[idx]

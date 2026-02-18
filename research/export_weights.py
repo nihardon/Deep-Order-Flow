@@ -1,35 +1,34 @@
 import torch
 import struct
-import os
 from train import MarketDN
 
-def export_model():
-    model_path = "../models/market_gnn.pth"
-    output_path = "../data/model_weights.bin"
+# Load model
+model = MarketDN()
+model.input_dim = 160
+model.output_dim = 3
+model.fc1 = torch.nn.Linear(160, 16)
+model.fc2 = torch.nn.Linear(16, 3)
 
-    print(f"--- LOADING MODEL FROM {model_path} ---")
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file not found at {model_path}")
+model.load_state_dict(torch.load("../models/market_gnn.pth", map_location='cpu'))
+model.eval()
 
-    model = MarketDN()
-    model.load_state_dict(torch.load(model_path, map_location='cpu'))
-    model.eval()
+print("Exporting weights to ../data/model_weights.bin ...")
+
+with open("../data/model_weights.bin", "wb") as f:
+    # Layer 1 Weights (16 x 160)
+    w1 = model.fc1.weight.detach().numpy().flatten()
+    f.write(struct.pack(f'{len(w1)}f', *w1))
     
-    with open(output_path, "wb") as f:
-        print(f"--- EXPORTING WEIGHTS TO {output_path} ---")
-        total_params = 0
-        
-        # Export parameters in order: fc1.weight, fc1.bias, fc2.weight, fc2.bias
-        for name, tensor in model.named_parameters():
-            data = tensor.detach().numpy().flatten()
-            binary_data = struct.pack(f'{len(data)}f', *data)
-            f.write(binary_data)
-            
-            print(f"Exported: {name:20} | Shape: {str(list(tensor.shape)):15} | Count: {len(data)}")
-            total_params += len(data)
+    # Layer 1 Bias (16)
+    b1 = model.fc1.bias.detach().numpy().flatten()
+    f.write(struct.pack(f'{len(b1)}f', *b1))
+    
+    # Layer 2 Weights (3 x 16)
+    w2 = model.fc2.weight.detach().numpy().flatten()
+    f.write(struct.pack(f'{len(w2)}f', *w2))
+    
+    # Layer 2 Bias (3)
+    b2 = model.fc2.bias.detach().numpy().flatten()
+    f.write(struct.pack(f'{len(b2)}f', *b2))
 
-    print("-" * 50)
-    print(f"SUCCESS: Exported {total_params} floats to {output_path}")
-
-if __name__ == "__main__":
-    export_model()
+print("Done. C++ Engine is ready to load.")

@@ -1,122 +1,88 @@
-import asyncio
-import websockets
-import json
+import ccxt
+import time
 import numpy as np
-import sys
 import struct
+import sys
 
-
-PAIR = "XBT/USD"
-URI = "wss://ws.kraken.com"
-
-mid_price_history = []
-MAX_HISTORY = 10
-
-def calculate_features(bids, asks):
-    """
-    Converts raw Bids/Asks into the 140-float feature vector.
-    """
-    global mid_price_history
-    
-    # Sort and Filter
-    sorted_bids = sorted(bids.items(), key=lambda x: x[0], reverse=True)[:10]
-    sorted_asks = sorted(asks.items(), key=lambda x: x[0])[:10]
-    
-    if len(sorted_bids) < 10 or len(sorted_asks) < 10:
-        return None
-
-    # Update History
-    best_bid = sorted_bids[0][0]
-    best_ask = sorted_asks[0][0]
+def get_features(bids, asks, mid_history, prev_ofi):
+    best_bid = bids[0][0]
+    best_ask = asks[0][0]
     mid_price = (best_bid + best_ask) / 2
     
-    mid_price_history.append(mid_price)
-    if len(mid_price_history) > MAX_HISTORY:
-        mid_price_history.pop(0)
+    mid_history.append(mid_price)
+    if len(mid_history) > 10: mid_history.pop(0)
     
-    if len(mid_price_history) < MAX_HISTORY:
-        return None 
+    if len(mid_history) < 10: return None, mid_price, prev_ofi
 
-    # Calculate Global Features
-    volatility = np.std(mid_price_history)
-    momentum = mid_price - mid_price_history[0]
-    spread = best_ask - best_bid
     
-    total_bid_vol = sum(v for p, v in sorted_bids)
-    total_ask_vol = sum(v for p, v in sorted_asks)
-    imbalance = (total_bid_vol - total_ask_vol) / (total_bid_vol + total_ask_vol + 1e-5)
+    # Volatility (Std Dev of % Returns)
+    hist_pct = [(mid_history[i] - mid_history[i-1])/mid_history[i-1] for i in range(1, len(mid_history))]
+    if len(hist_pct) == 0: hist_pct = [0.0]
+    volatility = np.std(hist_pct) * 1000
+    
+    # Momentum (% Change)
+    momentum = (mid_price - mid_history[0]) / mid_history[0] * 1000
+    
+    # Spread (% of price)
+    spread = (best_ask - best_bid) / mid_price * 1000
+    
+    # Imbalance
+    bid_vol = sum(item[1] for item in bids)
+    ask_vol = sum(item[1] for item in asks)
+    imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-5)
+    
+    # OFI
+    ofi_norm = np.tanh(imbalance)
 
-    feature_vector = []
+    features = []
     
-    # Bids
-    for p, v in sorted_bids:
+    for item in bids:
+        p = item[0]; v = item[1]
         norm_p = (p - mid_price) / mid_price * 1000
         log_v = np.log(v + 1.0)
-        feature_vector.extend([norm_p, log_v, -1.0, imbalance, spread, momentum, volatility])
+        features.extend([norm_p, log_v, -1.0, imbalance, spread, momentum, volatility, ofi_norm])
         
-    # Asks
-    for p, v in sorted_asks:
+    for item in asks:
+        p = item[0]; v = item[1]
         norm_p = (p - mid_price) / mid_price * 1000
         log_v = np.log(v + 1.0)
-        feature_vector.extend([norm_p, log_v, 1.0, imbalance, spread, momentum, volatility])
+        features.extend([norm_p, log_v, 1.0, imbalance, spread, momentum, volatility, ofi_norm])
         
-    return feature_vector
+    return features, mid_price, ofi_norm
 
-async def stream_market_data():
-    async with websockets.connect(URI) as websocket:
-        # Subscribe
-        msg = {
-            "event": "subscribe",
-            "pair": [PAIR],
-            "subscription": {"name": "book", "depth": 10}
-        }
-        await websocket.send(json.dumps(msg))
-        
-        # Local Order Book
-        bids = {}
-        asks = {}
-        
-        while True:
-            try:
-                message = await websocket.recv()
-                data = json.loads(message)
-                
-                if isinstance(data, list):
-                    payload = data[1]
-                    
-                    # Update Local Book (Snapshot)
-                    if 'bs' in payload or 'as' in payload: 
-                        bids = {float(x[0]): float(x[1]) for x in payload.get('bs', [])}
-                        asks = {float(x[0]): float(x[1]) for x in payload.get('as', [])}
-                    
-                    # Update Local Book (Updates)
-                    elif 'b' in payload or 'a' in payload: 
-                        for item in payload.get('b', []):
-                            p = float(item[0])
-                            v = float(item[1])
-                            if v == 0: bids.pop(p, None)
-                            else: bids[p] = v
-                            
-                        for item in payload.get('a', []):
-                            p = float(item[0])
-                            v = float(item[1])
-                            if v == 0: asks.pop(p, None)
-                            else: asks[p] = v
-
-                    # Generate Features
-                    features = calculate_features(bids, asks)
-                    
-                    if features:
-                        binary_data = struct.pack('140f', *features)
-                        sys.stdout.buffer.write(binary_data)
-                        sys.stdout.buffer.flush()
-                        
-            except Exception as e:
-                sys.stderr.write(f"Error: {e}\n")
-                continue
+def main():
+    kraken = ccxt.kraken({'enableRateLimit': False})
+    symbol = 'BTC/USDT'
+    mid_history = []
+    prev_ofi = 0
+    
+    sys.stderr.write(f"--- LIVE FEED (Percentage Mode) ---\n")
+    
+    while True:
+        try:
+            orderbook = kraken.fetch_order_book(symbol, limit=10)
+            bids = orderbook['bids']; asks = orderbook['asks']
+            
+            if len(bids) < 10 or len(asks) < 10: continue
+            
+            features, mid_price, prev_ofi = get_features(bids, asks, mid_history, prev_ofi)
+            
+            if features:
+                data = features + [mid_price] 
+                packed_data = struct.pack(f'{len(data)}f', *data)
+                sys.stdout.buffer.write(packed_data)
+                sys.stdout.flush()
+                sys.stderr.write(".")
+                sys.stderr.flush()
+            else:
+                sys.stderr.write("w"); sys.stderr.flush()
+            
+            time.sleep(1.0) 
+            
+        except Exception as e:
+            sys.stderr.write(f"\n[Error] {e}\n")
+            time.sleep(5) 
+            continue
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(stream_market_data())
-    except KeyboardInterrupt:
-        pass
+    main()

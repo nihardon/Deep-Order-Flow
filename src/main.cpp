@@ -1,112 +1,169 @@
 #include <iostream>
 #include <vector>
-#include <fstream>
 #include <cmath>
-#include <algorithm>
+#include <fstream>
 #include <iomanip>
-#include <unistd.h> // For reading from Stdin
+#include <algorithm>
 
+// CONFIGURATION
+const int INPUT_DIM = 160;   
+const int READ_DIM = 161;    
+const int HIDDEN_DIM = 16;
+const int OUTPUT_DIM = 3;
 
-struct Matrix {
-    std::vector<float> data;
-    int rows;
-    int cols;
-    Matrix(int r, int c) : rows(r), cols(c), data(r * c) {}
-    float& at(int r, int c) { return data[r * cols + c]; }
-    
-    static Matrix multiply(Matrix& A, Matrix& B) {
-        Matrix C(A.rows, B.cols);
-        for (int i = 0; i < A.rows; i++) {
-            for (int j = 0; j < B.cols; j++) {
-                float sum = 0.0f;
-                for (int k = 0; k < A.cols; k++) sum += A.at(i, k) * B.at(k, j);
-                C.at(i, j) = sum;
-            }
-        }
-        return C;
-    }
-    void relu() { for (float& val : data) if (val < 0) val = 0; }
-    void softmax() {
-        float max_val = *std::max_element(data.begin(), data.end());
-        float sum = 0.0f;
-        for (float& val : data) { val = std::exp(val - max_val); sum += val; }
-        for (float& val : data) val /= sum;
-    }
+//  Confidence
+const float CONFIDENCE_THRESHOLD = 0.60; 
+
+// Discipline
+int COOLDOWN_TICKS = 10;           
+const float TAKE_PROFIT = 0.0012;        
+const float STOP_LOSS   = 0.0025;        
+
+// AI exit sensitivity
+const int CONFIRMATION_STREAK = 8;
+
+struct MarketModel {
+    std::vector<float> w1; std::vector<float> b1;
+    std::vector<float> w2; std::vector<float> b2;
 };
 
-std::vector<float> load_weights(const std::string& filename) {
-    std::ifstream file(filename, std::ios::binary);
-    if (!file) throw std::runtime_error("Could not open " + filename);
-    file.seekg(0, std::ios::end);
-    std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
-    std::vector<float> buffer(size / sizeof(float));
-    if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) throw std::runtime_error("Read error");
-    return buffer;
+MarketModel load_weights(const std::string& path) {
+    MarketModel model;
+    std::ifstream file(path, std::ios::binary);
+    if (!file) { std::cerr << "Error: No model weights found. Did you run export_weights.py?" << std::endl; exit(1); }
+    
+    // Resize vectors
+    model.w1.resize(HIDDEN_DIM * INPUT_DIM); model.b1.resize(HIDDEN_DIM);
+    model.w2.resize(OUTPUT_DIM * HIDDEN_DIM); model.b2.resize(OUTPUT_DIM);
+    
+    // Read raw bytes
+    file.read(reinterpret_cast<char*>(model.w1.data()), model.w1.size() * sizeof(float));
+    file.read(reinterpret_cast<char*>(model.b1.data()), model.b1.size() * sizeof(float));
+    file.read(reinterpret_cast<char*>(model.w2.data()), model.w2.size() * sizeof(float));
+    file.read(reinterpret_cast<char*>(model.b2.data()), model.b2.size() * sizeof(float));
+    return model;
+}
+
+// Activation Functions
+void relu(std::vector<float>& x) { for (float& val : x) if (val < 0) val = 0; }
+void softmax(std::vector<float>& x) {
+    float max_val = -1e9, sum = 0;
+    for (float val : x) if (val > max_val) max_val = val;
+    for (float& val : x) { val = std::exp(val - max_val); sum += val; }
+    for (float& val : x) val /= sum;
 }
 
 int main() {
-    // Turn off synchronization with C-style I/O for speed
-    std::ios_base::sync_with_stdio(false);
-    std::cin.tie(NULL);
+    MarketModel model = load_weights("../data/model_weights.bin");
+    std::vector<float> input_buffer(READ_DIM);
+    std::vector<float> hidden(HIDDEN_DIM);
+    std::vector<float> output(OUTPUT_DIM);
 
-    try {
-        // Load Weights
-        std::vector<float> raw_weights = load_weights("../data/model_weights.bin");
-        int input_dim = 140; 
-        int hidden_size = 16;
+    // Trade state
+    bool has_position = false;
+    float entry_price = 0.0f;
+    int ticks_since_trade = 999; 
+    int sell_signal_streak = 0; 
+
+    std::cerr << "--- ENGINE ONLINE (High-Accuracy Mode) ---" << std::endl;
+
+    while (std::cin.read(reinterpret_cast<char*>(input_buffer.data()), READ_DIM * sizeof(float))) {
         
-        // Prepare Matrices
-        Matrix W1(input_dim, hidden_size);
-        for (int i=0; i < input_dim*hidden_size; i++) W1.data[i] = raw_weights[i];
+        float current_price = input_buffer[160];
         
-        Matrix W2(hidden_size, 3);
-        // Offset for second layer weights
-        int offset = input_dim*hidden_size; 
-
-        for (int i=0; i < hidden_size*3; i++) W2.data[i] = raw_weights[offset + i];
-
-        std::cerr << "--- HFT ENGINE ONLINE & WAITING FOR DATA ---" << std::endl;
-
-        // We read raw binary bytes from stdin
-        std::vector<float> input_buffer(input_dim);
+        std::fill(hidden.begin(), hidden.end(), 0.0f);
         
-        while (true) {
+        // Layer 1
+        for (int i = 0; i < HIDDEN_DIM; ++i) {
+            for (int j = 0; j < INPUT_DIM; ++j) {
+                hidden[i] += input_buffer[j] * model.w1[i * INPUT_DIM + j];
+            }
+            hidden[i] += model.b1[i];
+        }
+        relu(hidden);
+        
+        // Layer 2
+        std::fill(output.begin(), output.end(), 0.0f);
+        for (int i = 0; i < OUTPUT_DIM; ++i) {
+            for (int j = 0; j < HIDDEN_DIM; ++j) {
+                output[i] += hidden[j] * model.w2[i * HIDDEN_DIM + j];
+            }
+            output[i] += model.b2[i];
+        }
+        softmax(output);
 
-            std::cin.read(reinterpret_cast<char*>(input_buffer.data()), input_dim * sizeof(float));
+        float p_down = output[0];
+        // float p_flat = output[1];
+        float p_up   = output[2];
+        
+        std::cout << "TICK | " << current_price << " | " << p_up << " | " << p_down << std::endl;
+
+        ticks_since_trade++;
+
+        if (!has_position) {
             
-            if (std::cin.gcount() != input_dim * sizeof(float)) {
-                break; 
+            if (ticks_since_trade < COOLDOWN_TICKS) {
+                 if (ticks_since_trade % 60 == 0) {
+                     std::cerr << " [WAITING] Cooling down..." << std::endl;
+                 }
+                 continue;
             }
 
-            // Inference
-            Matrix input(1, input_dim);
-            input.data = input_buffer; 
+            // Buy
+            if (p_up > CONFIDENCE_THRESHOLD) {
+                std::cout << "ACTION | BUY | " << current_price << " | " << p_up << std::endl;
+                has_position = true;
+                entry_price = current_price;
+                ticks_since_trade = 0;
+                sell_signal_streak = 0;
+            }
+        } 
+        else {
+            // Sell
+            float pnl = (current_price - entry_price) / entry_price;
 
-            Matrix hidden = Matrix::multiply(input, W1);
-            hidden.relu();
-            
-            Matrix output = Matrix::multiply(hidden, W2);
-            output.softmax();
+            // Time Stop 
+            if (ticks_since_trade > 300 && pnl < -0.0005) { 
+                std::cout << "ACTION | SELL | " << current_price << " | " << p_down << std::endl;
+                std::cerr << " [TIME STOP] Stale trade. Exiting." << std::endl;
+                has_position = false;
+                ticks_since_trade = 0;
+                COOLDOWN_TICKS = 300;
+                continue;
+            }
 
-            // Output
-            float p_down = output.data[0];
-            float p_hold = output.data[1];
-            float p_up   = output.data[2];
-            
-            std::string signal = "HOLD";
-            if (p_up > 0.6) signal = "BUY  (UP)";
-            if (p_down > 0.6) signal = "SELL (DOWN)";
+            // Stop loss
+            if (pnl < -STOP_LOSS) {
+                std::cout << "ACTION | SELL | " << current_price << " | " << p_down << std::endl;
+                std::cerr << " [STOP LOSS] " << std::endl;
+                has_position = false;
+                ticks_since_trade = 0;
+                COOLDOWN_TICKS = 300; // PENALTY: Wait 5 mins (Stop Revenge Trading)
+                continue;
+            }
 
-            std::cerr << "\r[LIVE] BTC/USD | Down: " << std::fixed << std::setprecision(2) << p_down 
-                      << " | Hold: " << p_hold 
-                      << " | Up: " << p_up 
-                      << " | Signal: " << signal << "      " << std::flush;
+            // Take profit
+            if (pnl > TAKE_PROFIT) {
+                std::cout << "ACTION | SELL | " << current_price << " | " << p_down << std::endl;
+                std::cerr << " [TAKE PROFIT] " << std::endl;
+                has_position = false;
+                ticks_since_trade = 0;
+                COOLDOWN_TICKS = 10;
+                continue;
+            }
+
+            // AI reversal
+            if (p_down > 0.65) sell_signal_streak++;
+            else sell_signal_streak = 0;
+
+            if (sell_signal_streak >= CONFIRMATION_STREAK) {
+                std::cout << "ACTION | SELL | " << current_price << " | " << p_down << std::endl;
+                std::cerr << " [AI EXIT] " << std::endl;
+                has_position = false;
+                ticks_since_trade = 0;
+                COOLDOWN_TICKS = (pnl > 0) ? 10 : 300; 
+            }
         }
-
-    } catch (const std::exception& e) {
-        std::cerr << "FATAL ERROR: " << e.what() << std::endl;
-        return 1;
     }
     return 0;
 }
