@@ -1,83 +1,79 @@
 import torch
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv, global_mean_pool
 from torch_geometric.loader import DataLoader
 from dataset import LOBDataset
+import os
 
-# GNN Architecture
-class MarketGNN(torch.nn.Module):
+class MarketDN(torch.nn.Module):
     def __init__(self):
-        super(MarketGNN, self).__init__()
+        super(MarketDN, self).__init__()
         
-        # GAT Layer 1: Input 3 features (Price, Vol, Side) -> Hidden 16
-        self.conv1 = GATConv(3, 16, heads=2, concat=True) 
-        # Output size = 16 * 2 heads = 32
+        self.input_dim = 140 
+        self.hidden_dim = 16
+        self.output_dim = 3
         
-        # GAT Layer 2: Hidden 32 -> Hidden 16
-        self.conv2 = GATConv(32, 16, heads=1, concat=False)
+        self.fc1 = torch.nn.Linear(self.input_dim, self.hidden_dim)
         
-        # Fully Connected Classifier
-        self.fc = torch.nn.Linear(16, 3) # Output: 3 classes (Down, Hold, Up)
+        self.fc2 = torch.nn.Linear(self.hidden_dim, self.output_dim)
 
     def forward(self, data):
-        x, edge_index, batch = data.x, data.edge_index, data.batch
+        # Flatten the graph into a single vector
+        # [Batch, Node, Feature] -> [Batch, Node*Feature]
+        x = data.x.view(data.num_graphs, -1)
         
-        # Graph convolutions
-        x = self.conv1(x, edge_index)
-        x = F.elu(x)
-        x = F.dropout(x, p=0.2, training=self.training)
+        # Linear Layer 1
+        x = self.fc1(x)
+        x = F.relu(x) 
         
-        x = self.conv2(x, edge_index)
-        x = F.elu(x)
+        # Linear Layer 2
+        x = self.fc2(x)
         
-        # Pooling (Summarize the whole graph into one vector)
-        x = global_mean_pool(x, batch)
-        
-        # Classification
-        x = self.fc(x)
         return F.log_softmax(x, dim=1)
 
-# Training Loop
+# The Training Loop
 def train():
-    # Detect M2 Chip or use CPU
     device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
     print(f"Using Device: {device}")
     
-    # Load Data
     dataset = LOBDataset("../data/kraken_lob_data.h5")
-    # Split: 80% Train, 20% Test
+    
     train_size = int(len(dataset) * 0.8)
     test_size = len(dataset) - train_size
     train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
     
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
     
-    # Init model
-    model = MarketGNN().to(device)
+    model = MarketDN().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     
-    # Loop
-    print("--- STARTING TRAINING ---")
+    print("--- STARTING TRAINING (DENSE MODE) ---")
     model.train()
-    for epoch in range(5): # Run 5 times over the data
+    for epoch in range(10): 
         total_loss = 0
+        correct = 0
+        total_samples = 0
+        
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad()
             
             out = model(batch)
-            loss = F.nll_loss(out, batch.y) # Negative Log Likelihood Loss
+            loss = F.nll_loss(out, batch.y)
             
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
             
-        print(f"Epoch {epoch+1} | Loss: {total_loss / len(train_loader):.4f}")
+            pred = out.argmax(dim=1)
+            correct += int((pred == batch.y).sum())
+            total_samples += batch.y.size(0)
+            
+        acc = correct / total_samples
+        print(f"Epoch {epoch+1} | Loss: {total_loss / len(train_loader):.4f} | Acc: {acc*100:.2f}%")
         
-    # Save the Brain
-    torch.save(model.state_dict(), "../models/market_gnn.pth")
-    print("Model saved to market_gnn.pth")
+    os.makedirs("../models", exist_ok=True)
+    torch.save(model.state_dict(), "../models/market_gnn.pth") # Keep filename same for ease
+    print("Model saved to ../models/market_gnn.pth")
 
 if __name__ == "__main__":
     train()

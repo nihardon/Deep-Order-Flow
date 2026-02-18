@@ -1,7 +1,7 @@
 import torch
 import struct
 import os
-from train import MarketGNN
+from train import MarketDN
 
 def export_model():
     model_path = "../models/market_gnn.pth"
@@ -11,21 +11,17 @@ def export_model():
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found at {model_path}")
 
-    model = MarketGNN()
+    model = MarketDN()
     model.load_state_dict(torch.load(model_path, map_location='cpu'))
     model.eval()
     
     with open(output_path, "wb") as f:
         print(f"--- EXPORTING WEIGHTS TO {output_path} ---")
-        
         total_params = 0
         
-        # This iterates through every weight/bias in the exact order PyTorch sees them.
+        # Export parameters in order: fc1.weight, fc1.bias, fc2.weight, fc2.bias
         for name, tensor in model.named_parameters():
-            # Flatten to 1D array
             data = tensor.detach().numpy().flatten()
-            
-            # Write as 32-bit floats
             binary_data = struct.pack(f'{len(data)}f', *data)
             f.write(binary_data)
             
