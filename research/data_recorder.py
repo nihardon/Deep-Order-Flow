@@ -10,7 +10,7 @@ PAIR = "XBT/USD"
 URI = "wss://ws.kraken.com"
 
 BUFFER_SIZE = 1000 
-OUTPUT_FILE = "kraken_lob_data.h5"
+OUTPUT_FILE = "../data/kraken_lob_data.h5"
 
 async def record_order_book():
     async with websockets.connect(URI) as websocket:
