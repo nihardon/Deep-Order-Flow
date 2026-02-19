@@ -6,13 +6,13 @@ A real-time BTC/USD scalping system that uses a neural network trained on limit 
 
 ```
 ┌─────────────┐       binary stdin       ┌─────────────┐       text stdout       ┌─────────────┐
-│  live_feed   │ ──────────────────────► │  hft_engine  │ ──────────────────────► │  dashboard   │
-│  (Python)    │   160 features + price   │  (C++17)     │   TICK / ACTION msgs    │  (Python)    │
-│              │                          │              │                          │              │
-│  WebSocket   │                          │  MLP Infer   │                          │  Paper Trade │
-│  Order Book  │                          │  Buy/Sell    │                          │  Win Rate    │
-│  Features    │                          │  Logic       │                          │  PnL         │
-└─────────────┘                          └─────────────┘                          └─────────────┘
+│  live_feed  │ ──────────────────────►  │  hft_engine │ ──────────────────────► │ dashboard   │
+│  (Python)   │   160 features + price   │  (C++17)    │   TICK / ACTION msgs    │ (Python)    │
+│             │                          │             │                         │             │
+│  WebSocket  │                          │  MLP Infer  │                         │ Paper Trade │
+│  Order Book │                          │  Buy/Sell   │                         │ Win Rate    │
+│  Features   │                          │  Logic      │                         │ PnL         │
+└─────────────┘                          └─────────────┘                         └─────────────┘
 ```
 
 The pipeline is connected via Unix pipes: `live_feed.py | ./hft_engine | dashboard.py`
