@@ -137,7 +137,7 @@ class LOBDataset(Dataset):
                             # (End - Start) / Start
                             ret = (end_price - start_price) / start_price
                             
-                            threshold = 0.00002 
+                            threshold = 0.0002 
                             
                             if ret > threshold:
                                 up_samples.append(self.create_sample(old_sample, 2))
