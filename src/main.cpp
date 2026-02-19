@@ -6,21 +6,19 @@
 #include <algorithm>
 
 // CONFIGURATION
+const float FEES = 0.0000; 
+const float MIN_NET_PROFIT = 0.0005; 
+const float STOP_LOSS = 0.0020; 
+const float CONFIDENCE_THRESHOLD = 0.60; 
+const int TICKS_PER_SEC = 50;
+const int MAX_HOLD_TICKS = 60 * TICKS_PER_SEC; 
+int PENALTY_COOLDOWN = 10 * TICKS_PER_SEC; 
+int PROFIT_COOLDOWN = 2 * TICKS_PER_SEC;
+
 const int INPUT_DIM = 160;   
 const int READ_DIM = 161;    
 const int HIDDEN_DIM = 16;
 const int OUTPUT_DIM = 3;
-
-//  Confidence
-const float CONFIDENCE_THRESHOLD = 0.60; 
-
-// Discipline
-int COOLDOWN_TICKS = 10;           
-const float TAKE_PROFIT = 0.0012;        
-const float STOP_LOSS   = 0.0025;        
-
-// AI exit sensitivity
-const int CONFIRMATION_STREAK = 8;
 
 struct MarketModel {
     std::vector<float> w1; std::vector<float> b1;
@@ -30,13 +28,12 @@ struct MarketModel {
 MarketModel load_weights(const std::string& path) {
     MarketModel model;
     std::ifstream file(path, std::ios::binary);
-    if (!file) { std::cerr << "Error: No model weights found. Did you run export_weights.py?" << std::endl; exit(1); }
-    
-    // Resize vectors
+    if (!file) { 
+        std::cerr << "Error: No model weights found at " << path << std::endl; 
+        exit(1); 
+    }
     model.w1.resize(HIDDEN_DIM * INPUT_DIM); model.b1.resize(HIDDEN_DIM);
     model.w2.resize(OUTPUT_DIM * HIDDEN_DIM); model.b2.resize(OUTPUT_DIM);
-    
-    // Read raw bytes
     file.read(reinterpret_cast<char*>(model.w1.data()), model.w1.size() * sizeof(float));
     file.read(reinterpret_cast<char*>(model.b1.data()), model.b1.size() * sizeof(float));
     file.read(reinterpret_cast<char*>(model.w2.data()), model.w2.size() * sizeof(float));
@@ -44,7 +41,6 @@ MarketModel load_weights(const std::string& path) {
     return model;
 }
 
-// Activation Functions
 void relu(std::vector<float>& x) { for (float& val : x) if (val < 0) val = 0; }
 void softmax(std::vector<float>& x) {
     float max_val = -1e9, sum = 0;
@@ -59,21 +55,22 @@ int main() {
     std::vector<float> hidden(HIDDEN_DIM);
     std::vector<float> output(OUTPUT_DIM);
 
-    // Trade state
+    // Trading State
     bool has_position = false;
     float entry_price = 0.0f;
-    int ticks_since_trade = 999; 
+    int ticks_since_trade = 0; 
     int sell_signal_streak = 0; 
+    int required_cooldown = 0;
 
-    std::cerr << "--- ENGINE ONLINE (High-Accuracy Mode) ---" << std::endl;
+    std::cerr << "--- HFT SCALPER ONLINE ---" << std::endl;
+    std::cerr << "   - Target: " << (MIN_NET_PROFIT * 100) << "%" << std::endl;
 
     while (std::cin.read(reinterpret_cast<char*>(input_buffer.data()), READ_DIM * sizeof(float))) {
         
         float current_price = input_buffer[160];
         
+        // Inference
         std::fill(hidden.begin(), hidden.end(), 0.0f);
-        
-        // Layer 1
         for (int i = 0; i < HIDDEN_DIM; ++i) {
             for (int j = 0; j < INPUT_DIM; ++j) {
                 hidden[i] += input_buffer[j] * model.w1[i * INPUT_DIM + j];
@@ -81,8 +78,6 @@ int main() {
             hidden[i] += model.b1[i];
         }
         relu(hidden);
-        
-        // Layer 2
         std::fill(output.begin(), output.end(), 0.0f);
         for (int i = 0; i < OUTPUT_DIM; ++i) {
             for (int j = 0; j < HIDDEN_DIM; ++j) {
@@ -93,18 +88,18 @@ int main() {
         softmax(output);
 
         float p_down = output[0];
-        // float p_flat = output[1];
         float p_up   = output[2];
         
+        // Feedback
         std::cout << "TICK | " << current_price << " | " << p_up << " | " << p_down << std::endl;
 
         ticks_since_trade++;
 
         if (!has_position) {
             
-            if (ticks_since_trade < COOLDOWN_TICKS) {
-                 if (ticks_since_trade % 60 == 0) {
-                     std::cerr << " [WAITING] Cooling down..." << std::endl;
+            if (ticks_since_trade < required_cooldown) {
+                 if (ticks_since_trade % (TICKS_PER_SEC * 2) == 0) {
+                     std::cerr << " [WAITING] Cooldown. " << std::endl;
                  }
                  continue;
             }
@@ -116,52 +111,56 @@ int main() {
                 entry_price = current_price;
                 ticks_since_trade = 0;
                 sell_signal_streak = 0;
+                required_cooldown = 0;
             }
         } 
         else {
             // Sell
-            float pnl = (current_price - entry_price) / entry_price;
+            
+            // PnL
+            float raw_pnl = (current_price - entry_price) / entry_price;
 
-            // Time Stop 
-            if (ticks_since_trade > 300 && pnl < -0.0005) { 
+            // Time Stop
+            if (ticks_since_trade > MAX_HOLD_TICKS && raw_pnl < 0) { 
                 std::cout << "ACTION | SELL | " << current_price << " | " << p_down << std::endl;
-                std::cerr << " [TIME STOP] Stale trade. Exiting." << std::endl;
+                std::cerr << " [TIME STOP] Too slow. Next!" << std::endl;
                 has_position = false;
                 ticks_since_trade = 0;
-                COOLDOWN_TICKS = 300;
+                required_cooldown = PENALTY_COOLDOWN;
                 continue;
             }
 
-            // Stop loss
-            if (pnl < -STOP_LOSS) {
+            // Stop Loss
+            if (raw_pnl < -STOP_LOSS) {
                 std::cout << "ACTION | SELL | " << current_price << " | " << p_down << std::endl;
-                std::cerr << " [STOP LOSS] " << std::endl;
+                std::cerr << " [STOP LOSS] Cut loss." << std::endl;
                 has_position = false;
                 ticks_since_trade = 0;
-                COOLDOWN_TICKS = 300; // PENALTY: Wait 5 mins (Stop Revenge Trading)
+                required_cooldown = PENALTY_COOLDOWN;
                 continue;
             }
 
-            // Take profit
-            if (pnl > TAKE_PROFIT) {
+            // Take Profit
+            if (raw_pnl > MIN_NET_PROFIT) {
                 std::cout << "ACTION | SELL | " << current_price << " | " << p_down << std::endl;
-                std::cerr << " [TAKE PROFIT] " << std::endl;
+                std::cerr << " [SCALP] Bagged +" << (raw_pnl*100) << "%" << std::endl;
                 has_position = false;
                 ticks_since_trade = 0;
-                COOLDOWN_TICKS = 10;
+                required_cooldown = PROFIT_COOLDOWN;
                 continue;
             }
 
-            // AI reversal
-            if (p_down > 0.65) sell_signal_streak++;
+            // 4. AI EXIT (Sensitive)
+            // If AI sees DOWN 4 times in a row, sell.
+            if (p_down > 0.60) sell_signal_streak++;
             else sell_signal_streak = 0;
 
-            if (sell_signal_streak >= CONFIRMATION_STREAK) {
+            if (sell_signal_streak >= 4) {
                 std::cout << "ACTION | SELL | " << current_price << " | " << p_down << std::endl;
-                std::cerr << " [AI EXIT] " << std::endl;
+                std::cerr << " [AI EXIT] Dumping." << std::endl;
                 has_position = false;
                 ticks_since_trade = 0;
-                COOLDOWN_TICKS = (pnl > 0) ? 10 : 300; 
+                required_cooldown = PENALTY_COOLDOWN; 
             }
         }
     }

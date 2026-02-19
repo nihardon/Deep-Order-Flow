@@ -1,88 +1,123 @@
-import ccxt
-import time
-import numpy as np
-import struct
+import asyncio
+import websockets
+import json
 import sys
+import numpy as np
 
-def get_features(bids, asks, mid_history, prev_ofi):
-    best_bid = bids[0][0]
-    best_ask = asks[0][0]
-    mid_price = (best_bid + best_ask) / 2
-    
-    mid_history.append(mid_price)
-    if len(mid_history) > 10: mid_history.pop(0)
-    
-    if len(mid_history) < 10: return None, mid_price, prev_ofi
+# CONFIGURATION
+PAIR = "XBT/USD"
+URI = "wss://ws.kraken.com"
 
-    
-    # Volatility (Std Dev of % Returns)
-    hist_pct = [(mid_history[i] - mid_history[i-1])/mid_history[i-1] for i in range(1, len(mid_history))]
-    if len(hist_pct) == 0: hist_pct = [0.0]
-    volatility = np.std(hist_pct) * 1000
-    
-    # Momentum (% Change)
-    momentum = (mid_price - mid_history[0]) / mid_history[0] * 1000
-    
-    # Spread (% of price)
-    spread = (best_ask - best_bid) / mid_price * 1000
-    
-    # Imbalance
-    bid_vol = sum(item[1] for item in bids)
-    ask_vol = sum(item[1] for item in asks)
-    imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-5)
-    
-    # OFI
-    ofi_norm = np.tanh(imbalance)
+HISTORY_LENGTH = 100 
 
-    features = []
-    
-    for item in bids:
-        p = item[0]; v = item[1]
-        norm_p = (p - mid_price) / mid_price * 1000
-        log_v = np.log(v + 1.0)
-        features.extend([norm_p, log_v, -1.0, imbalance, spread, momentum, volatility, ofi_norm])
+async def run_feed():
+    async with websockets.connect(URI) as websocket:
+        subscribe_msg = {
+            "event": "subscribe",
+            "pair": [PAIR],
+            "subscription": {"name": "book", "depth": 10}
+        }
+        await websocket.send(json.dumps(subscribe_msg))
+
+        # Buffers
+        history = []
+        prev_bid = 0
+        prev_ask = 0
         
-    for item in asks:
-        p = item[0]; v = item[1]
-        norm_p = (p - mid_price) / mid_price * 1000
-        log_v = np.log(v + 1.0)
-        features.extend([norm_p, log_v, 1.0, imbalance, spread, momentum, volatility, ofi_norm])
-        
-    return features, mid_price, ofi_norm
+        # Order Book State
+        bids = {}
+        asks = {}
 
-def main():
-    kraken = ccxt.kraken({'enableRateLimit': False})
-    symbol = 'BTC/USDT'
-    mid_history = []
-    prev_ofi = 0
-    
-    sys.stderr.write(f"--- LIVE FEED (Percentage Mode) ---\n")
-    
-    while True:
-        try:
-            orderbook = kraken.fetch_order_book(symbol, limit=10)
-            bids = orderbook['bids']; asks = orderbook['asks']
-            
-            if len(bids) < 10 or len(asks) < 10: continue
-            
-            features, mid_price, prev_ofi = get_features(bids, asks, mid_history, prev_ofi)
-            
-            if features:
-                data = features + [mid_price] 
-                packed_data = struct.pack(f'{len(data)}f', *data)
+        while True:
+            try:
+                message = await websocket.recv()
+                data = json.loads(message)
+
+                # Expect list [channelID, payload, ...]
+                if not isinstance(data, list): continue
+                
+                payload = data[1]
+                
+                # Update Book
+                updates = []
+                if isinstance(payload, dict):
+                    updates += payload.get('bs', []) + payload.get('b', []) # Bids
+                    updates += payload.get('as', []) + payload.get('a', []) # Asks
+                    
+
+                    for item in payload.get('bs', []) + payload.get('b', []):
+                        bids[float(item[0])] = float(item[1])
+                    for item in payload.get('as', []) + payload.get('a', []):
+                        asks[float(item[0])] = float(item[1])
+                        
+                    # Clean zero volume levels
+                    bids = {k:v for k,v in bids.items() if v > 0}
+                    asks = {k:v for k,v in asks.items() if v > 0}
+                
+                if len(bids) < 1 or len(asks) < 1: continue
+
+                # Sort
+                best_bid = max(bids.keys())
+                best_ask = min(asks.keys())
+                mid_price = (best_bid + best_ask) / 2.0
+                
+                # Update History
+                history.append(mid_price)
+                if len(history) > HISTORY_LENGTH: history.pop(0)
+                
+                # Need full history to start
+                if len(history) < HISTORY_LENGTH: continue
+
+                
+                # Volatility
+                hist_pct = [(history[i] - history[i-1])/history[i-1] for i in range(1, len(history))]
+                if len(hist_pct) == 0: hist_pct = [0.0]
+                volatility = np.std(hist_pct) * 1000
+
+                # Momentum
+                momentum = (mid_price - history[0]) / history[0] * 1000
+                
+                # Spread
+                spread = (best_ask - best_bid) / mid_price * 1000
+                
+                # OFI
+                ofi = 0
+                ofi_norm = np.tanh(ofi)
+                
+                # Imbalance
+                imbalance = 0.0
+                
+                # [PriceDist, LogVol, Side, Imbalance, Spread, Momentum, Volatility, OFI]                
+                feature_vector = []
+                
+                sorted_bids = sorted(bids.items(), key=lambda x: x[0], reverse=True)[:10]
+                sorted_asks = sorted(asks.items(), key=lambda x: x[0])[:10]
+                
+                # Fill Bids
+                for i in range(10):
+                    p, v = sorted_bids[i] if i < len(sorted_bids) else (best_bid, 0)
+                    norm_p = (p - mid_price) / mid_price * 1000
+                    log_v = np.log(v + 1.0)
+                    feature_vector.extend([norm_p, log_v, -1.0, imbalance, spread, momentum, volatility, ofi_norm])
+                    
+                # Fill Asks
+                for i in range(10):
+                    p, v = sorted_asks[i] if i < len(sorted_asks) else (best_ask, 0)
+                    norm_p = (p - mid_price) / mid_price * 1000
+                    log_v = np.log(v + 1.0)
+                    feature_vector.extend([norm_p, log_v, 1.0, imbalance, spread, momentum, volatility, ofi_norm])
+                
+                feature_vector.append(mid_price)
+                
+                packed_data = np.array(feature_vector, dtype=np.float32).tobytes()
                 sys.stdout.buffer.write(packed_data)
-                sys.stdout.flush()
-                sys.stderr.write(".")
-                sys.stderr.flush()
-            else:
-                sys.stderr.write("w"); sys.stderr.flush()
-            
-            time.sleep(1.0) 
-            
-        except Exception as e:
-            sys.stderr.write(f"\n[Error] {e}\n")
-            time.sleep(5) 
-            continue
+                sys.stdout.buffer.flush()
+
+            except Exception:
+                continue
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(run_feed())
+    except KeyboardInterrupt:
+        pass
