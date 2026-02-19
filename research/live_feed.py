@@ -8,7 +8,7 @@ import numpy as np
 PAIR = "XBT/USD"
 URI = "wss://ws.kraken.com"
 
-HISTORY_LENGTH = 100 
+HISTORY_LENGTH = 10
 
 async def run_feed():
     async with websockets.connect(URI) as websocket:
@@ -21,8 +21,10 @@ async def run_feed():
 
         # Buffers
         history = []
-        prev_bid = 0
-        prev_ask = 0
+        prev_bid_p = 0.0
+        prev_bid_v = 0.0
+        prev_ask_p = 0.0
+        prev_ask_v = 0.0
         
         # Order Book State
         bids = {}
@@ -80,12 +82,29 @@ async def run_feed():
                 # Spread
                 spread = (best_ask - best_bid) / mid_price * 1000
                 
-                # OFI
-                ofi = 0
-                ofi_norm = np.tanh(ofi)
+                # OFI (matches dataset.py logic)
+                best_bid_v = bids.get(best_bid, 0.0)
+                best_ask_v = asks.get(best_ask, 0.0)
+
+                ofi_bid = 0.0
+                if best_bid > prev_bid_p: ofi_bid = best_bid_v
+                elif best_bid < prev_bid_p: ofi_bid = -prev_bid_v
+                else: ofi_bid = best_bid_v - prev_bid_v
+
+                ofi_ask = 0.0
+                if best_ask > prev_ask_p: ofi_ask = prev_ask_v
+                elif best_ask < prev_ask_p: ofi_ask = -prev_ask_v
+                else: ofi_ask = best_ask_v - prev_ask_v
+
+                ofi_norm = np.tanh(ofi_bid - ofi_ask)
+
+                prev_bid_p = best_bid; prev_bid_v = best_bid_v
+                prev_ask_p = best_ask; prev_ask_v = best_ask_v
                 
                 # Imbalance
-                imbalance = 0.0
+                total_bid_vol = sum(bids.values())
+                total_ask_vol = sum(asks.values())
+                imbalance = (total_bid_vol - total_ask_vol) / (total_bid_vol + total_ask_vol + 1e-5)
                 
                 # [PriceDist, LogVol, Side, Imbalance, Spread, Momentum, Volatility, OFI]                
                 feature_vector = []

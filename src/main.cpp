@@ -9,7 +9,7 @@
 const float FEES = 0.0000; 
 const float MIN_NET_PROFIT = 0.0005; 
 const float STOP_LOSS = 0.0020; 
-const float CONFIDENCE_THRESHOLD = 0.60; 
+const float CONFIDENCE_THRESHOLD = 0.65; 
 const int TICKS_PER_SEC = 50;
 const int MAX_HOLD_TICKS = 60 * TICKS_PER_SEC; 
 int PENALTY_COOLDOWN = 10 * TICKS_PER_SEC; 
@@ -17,13 +17,22 @@ int PROFIT_COOLDOWN = 2 * TICKS_PER_SEC;
 
 const int INPUT_DIM = 160;   
 const int READ_DIM = 161;    
-const int HIDDEN_DIM = 16;
+const int HIDDEN1_DIM = 64;
+const int HIDDEN2_DIM = 32;
 const int OUTPUT_DIM = 3;
 
 struct MarketModel {
     std::vector<float> w1; std::vector<float> b1;
     std::vector<float> w2; std::vector<float> b2;
+    std::vector<float> w3; std::vector<float> b3;
 };
+
+void load_layer(std::ifstream& file, std::vector<float>& w, std::vector<float>& b, int rows, int cols) {
+    w.resize(rows * cols);
+    b.resize(rows);
+    file.read(reinterpret_cast<char*>(w.data()), w.size() * sizeof(float));
+    file.read(reinterpret_cast<char*>(b.data()), b.size() * sizeof(float));
+}
 
 MarketModel load_weights(const std::string& path) {
     MarketModel model;
@@ -32,12 +41,9 @@ MarketModel load_weights(const std::string& path) {
         std::cerr << "Error: No model weights found at " << path << std::endl; 
         exit(1); 
     }
-    model.w1.resize(HIDDEN_DIM * INPUT_DIM); model.b1.resize(HIDDEN_DIM);
-    model.w2.resize(OUTPUT_DIM * HIDDEN_DIM); model.b2.resize(OUTPUT_DIM);
-    file.read(reinterpret_cast<char*>(model.w1.data()), model.w1.size() * sizeof(float));
-    file.read(reinterpret_cast<char*>(model.b1.data()), model.b1.size() * sizeof(float));
-    file.read(reinterpret_cast<char*>(model.w2.data()), model.w2.size() * sizeof(float));
-    file.read(reinterpret_cast<char*>(model.b2.data()), model.b2.size() * sizeof(float));
+    load_layer(file, model.w1, model.b1, HIDDEN1_DIM, INPUT_DIM);
+    load_layer(file, model.w2, model.b2, HIDDEN2_DIM, HIDDEN1_DIM);
+    load_layer(file, model.w3, model.b3, OUTPUT_DIM, HIDDEN2_DIM);
     return model;
 }
 
@@ -52,7 +58,8 @@ void softmax(std::vector<float>& x) {
 int main() {
     MarketModel model = load_weights("../data/model_weights.bin");
     std::vector<float> input_buffer(READ_DIM);
-    std::vector<float> hidden(HIDDEN_DIM);
+    std::vector<float> hidden1(HIDDEN1_DIM);
+    std::vector<float> hidden2(HIDDEN2_DIM);
     std::vector<float> output(OUTPUT_DIM);
 
     // Trading State
@@ -69,21 +76,28 @@ int main() {
         
         float current_price = input_buffer[160];
         
-        // Inference
-        std::fill(hidden.begin(), hidden.end(), 0.0f);
-        for (int i = 0; i < HIDDEN_DIM; ++i) {
-            for (int j = 0; j < INPUT_DIM; ++j) {
-                hidden[i] += input_buffer[j] * model.w1[i * INPUT_DIM + j];
-            }
-            hidden[i] += model.b1[i];
+        // Inference: fc1 -> relu -> fc2 -> relu -> fc3 -> softmax
+        std::fill(hidden1.begin(), hidden1.end(), 0.0f);
+        for (int i = 0; i < HIDDEN1_DIM; ++i) {
+            for (int j = 0; j < INPUT_DIM; ++j)
+                hidden1[i] += input_buffer[j] * model.w1[i * INPUT_DIM + j];
+            hidden1[i] += model.b1[i];
         }
-        relu(hidden);
+        relu(hidden1);
+
+        std::fill(hidden2.begin(), hidden2.end(), 0.0f);
+        for (int i = 0; i < HIDDEN2_DIM; ++i) {
+            for (int j = 0; j < HIDDEN1_DIM; ++j)
+                hidden2[i] += hidden1[j] * model.w2[i * HIDDEN1_DIM + j];
+            hidden2[i] += model.b2[i];
+        }
+        relu(hidden2);
+
         std::fill(output.begin(), output.end(), 0.0f);
         for (int i = 0; i < OUTPUT_DIM; ++i) {
-            for (int j = 0; j < HIDDEN_DIM; ++j) {
-                output[i] += hidden[j] * model.w2[i * HIDDEN_DIM + j];
-            }
-            output[i] += model.b2[i];
+            for (int j = 0; j < HIDDEN2_DIM; ++j)
+                output[i] += hidden2[j] * model.w3[i * HIDDEN2_DIM + j];
+            output[i] += model.b3[i];
         }
         softmax(output);
 
@@ -150,12 +164,10 @@ int main() {
                 continue;
             }
 
-            // 4. AI EXIT (Sensitive)
-            // If AI sees DOWN 4 times in a row, sell.
-            if (p_down > 0.60) sell_signal_streak++;
+            if (p_down > 0.70) sell_signal_streak++;
             else sell_signal_streak = 0;
 
-            if (sell_signal_streak >= 4) {
+            if (sell_signal_streak >= 8) {
                 std::cout << "ACTION | SELL | " << current_price << " | " << p_down << std::endl;
                 std::cerr << " [AI EXIT] Dumping." << std::endl;
                 has_position = false;

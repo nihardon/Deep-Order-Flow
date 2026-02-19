@@ -1,9 +1,9 @@
 import h5py
 import torch
+from torch.utils.data import Dataset
 import json
 import numpy as np
 import random
-from torch_geometric.data import Data, Dataset
 from tqdm import tqdm
 
 class LOBDataset(Dataset):
@@ -13,7 +13,7 @@ class LOBDataset(Dataset):
             h5_file (str): Path to the .h5 file containing 'raw_json' dataset.
             lookahead (int): How many ticks into the future to predict price movement.
         """
-        super().__init__(root=None, transform=None, pre_transform=None)
+        super().__init__()
         self.h5_file = h5_file
         self.lookahead = lookahead
         self.samples = [] 
@@ -140,12 +140,12 @@ class LOBDataset(Dataset):
                             threshold = 0.00002 
                             
                             if ret > threshold:
-                                up_samples.append(self.create_data_object(old_sample, 2))
+                                up_samples.append(self.create_sample(old_sample, 2))
                             elif ret < -threshold:
-                                down_samples.append(self.create_data_object(old_sample, 0))
+                                down_samples.append(self.create_sample(old_sample, 0))
                             else:
                                 if random.random() < 0.20: 
-                                    flat_samples.append(self.create_data_object(old_sample, 1))
+                                    flat_samples.append(self.create_sample(old_sample, 1))
 
                 except Exception:
                     continue
@@ -174,9 +174,9 @@ class LOBDataset(Dataset):
         print(f"   - DOWN: {len(down_samples)}")
         print(f"   - FLAT: {len(flat_samples)}")
 
-    def create_data_object(self, sample, label):
+    def create_sample(self, sample, label):
         """
-        Converts a dictionary of raw market data into a PyTorch Geometric Graph object.
+        Converts raw market data into a flat feature vector + label.
         Features are normalized to be Percentage/Relative.
         """
         current_mid = sample['mid']
@@ -204,35 +204,22 @@ class LOBDataset(Dataset):
         total_ask_vol = sum(v for p, v in asks)
         imbalance = (total_bid_vol - total_ask_vol) / (total_bid_vol + total_ask_vol + 1e-5)
 
-        # Build Graph Nodes
-        node_features = []
+        # [PriceDist, LogVol, Side, Imbalance, Spread, Momentum, Volatility, OFI] per level
+        features = []
         
-        # Process Bids
         for p, v in bids:
-            # Price Distance (%)
             norm_p = (p - current_mid) / current_mid * 1000 
             log_v = np.log(v + 1.0) 
+            features.extend([norm_p, log_v, -1.0, imbalance, spread, momentum, volatility, ofi_norm])
             
-            # Feature Vector
-            # [PriceDist, LogVol, Side(-1), Imbalance, Spread, Momentum, Volatility, OFI]
-            node_features.append([norm_p, log_v, -1.0, imbalance, spread, momentum, volatility, ofi_norm])
-            
-        # Process Asks
         for p, v in asks:
             norm_p = (p - current_mid) / current_mid * 1000
             log_v = np.log(v + 1.0)
-            
-            # Feature Vector
-            # [PriceDist, LogVol, Side(+1), Imbalance, Spread, Momentum, Volatility, OFI]
-            node_features.append([norm_p, log_v, 1.0, imbalance, spread, momentum, volatility, ofi_norm])
-            
-        x = torch.tensor(node_features, dtype=torch.float)
-        
-        edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
-        
-        y = torch.tensor([label], dtype=torch.long)
-        
-        return Data(x=x, edge_index=edge_index, y=y)
+            features.extend([norm_p, log_v, 1.0, imbalance, spread, momentum, volatility, ofi_norm])
 
-    def len(self): return len(self.samples)
-    def get(self, idx): return self.samples[idx]
+        x = torch.tensor(features, dtype=torch.float)
+        y = torch.tensor(label, dtype=torch.long)
+        return (x, y)
+
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, idx): return self.samples[idx]
