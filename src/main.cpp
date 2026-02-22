@@ -7,13 +7,13 @@
 
 // CONFIGURATION
 const float FEES = 0.0000; 
-const float MIN_NET_PROFIT = 0.0005; 
-const float STOP_LOSS = 0.0020; 
+const float MIN_NET_PROFIT = 0.0002; 
+const float STOP_LOSS = 0.0010; 
 const float CONFIDENCE_THRESHOLD = 0.65; 
 const int TICKS_PER_SEC = 50;
-const int MAX_HOLD_TICKS = 60 * TICKS_PER_SEC; 
-int PENALTY_COOLDOWN = 10 * TICKS_PER_SEC; 
-int PROFIT_COOLDOWN = 2 * TICKS_PER_SEC;
+const int MAX_HOLD_TICKS = 10 * TICKS_PER_SEC; 
+int PENALTY_COOLDOWN = 2 * TICKS_PER_SEC; 
+int PROFIT_COOLDOWN = 1 * TICKS_PER_SEC;
 
 const int INPUT_DIM = 160;   
 const int READ_DIM = 161;    

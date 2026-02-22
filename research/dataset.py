@@ -7,7 +7,7 @@ import random
 from tqdm import tqdm
 
 class LOBDataset(Dataset):
-    def __init__(self, h5_file, lookahead=100): 
+    def __init__(self, h5_file, lookahead=15): 
         """
         Args:
             h5_file (str): Path to the .h5 file containing 'raw_json' dataset.
@@ -137,7 +137,7 @@ class LOBDataset(Dataset):
                             # (End - Start) / Start
                             ret = (end_price - start_price) / start_price
                             
-                            threshold = 0.0002 
+                            threshold = 0.00005 
                             
                             if ret > threshold:
                                 up_samples.append(self.create_sample(old_sample, 2))
